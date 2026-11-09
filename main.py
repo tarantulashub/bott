@@ -1,141 +1,160 @@
 import os
 import time
+from collections import defaultdict
 from flask import Flask, request
 import telebot
-from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+from telebot import types
 
+# 2. Configuración de credenciales y entorno
 TOKEN = os.environ.get('BOT_TOKEN')
-# Reemplaza o configura esta variable en Render con el link de tu Mini App (ej. Vercel)
-MINI_APP_URL = os.environ.get(
-    'MINI_APP_URL', 'https://tu-mini-app-en-vercel.app'
-)
+MINI_APP_URL = os.environ.get('MINI_APP_URL')
 
-bot = telebot.TeleBot(TOKEN)
+if not TOKEN:
+    raise ValueError("La variable de entorno 'BOT_TOKEN' es obligatoria.")
+if not MINI_APP_URL:
+    raise ValueError("La variable de entorno 'MINI_APP_URL' es obligatoria.")
+
+# Inicializar bot (threaded=False recomendado en entornos de Webhook con Flask)
+bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
 
-# Memoria temporal para el control Anti-Spam
-# Estructura: {user_id: {"timestamps": [], "ban_until": timestamp, "ban_level": 0}}
-user_tracker = {}
+# 5. Sistema Anti-Spam Progresivo por user_id
+# Estructura: {user_id: {"last_time": float, "warnings": int, "ban_until": float, "last_ban_level": int}}
+spam_control = defaultdict(lambda: {"last_time": 0.0, "warnings": 0, "ban_until": 0.0, "last_ban_level": 0})
 
+def check_antispam(message):
+    """
+    Controla la frecuencia de mensajes por usuario:
+    - Nivel 1: Advertencia formal.
+    - Nivel 2: Bloqueo temporal de 1 minuto.
+    - Nivel 3: Bloqueo severo de 24 horas por reincidencia inmediata tras el castigo anterior.
+    """
+    user_id = message.from_user.id
+    current_time = time.time()
+    data = spam_control[user_id]
 
-def check_spam(user_id):
-  now = time.time()
-  if user_id not in user_tracker:
-    user_tracker[user_id] = {
-        'timestamps': [],
-        'ban_until': 0,
-        'ban_level': 0,
-    }
+    # Verificar si el usuario se encuentra actualmente bajo un bloqueo activo
+    if current_time < data["ban_until"]:
+        return False
 
-  data = user_tracker[user_id]
+    time_diff = current_time - data["last_time"]
 
-  # Verificar si el usuario está actualmente en período de castigo
-  if now < data['ban_until']:
-    remaining = int(data['ban_until'] - now)
-    return (
-        True,
-        f'🚫 Estás bloqueado temporalmente por spam. Intenta de nuevo en {remaining} segundos.',
+    # Umbral de tiempo considerado spam (mensajes con menos de 1.2 segundos de diferencia)
+    if time_diff < 1.2:
+        if data["warnings"] == 0 and data["last_ban_level"] == 0:
+            # Nivel 1: Advertencia formal
+            data["warnings"] = 1
+            data["last_time"] = current_time
+            bot.reply_to(
+                message, 
+                "⚠️ **Advertencia formal:** Estás enviando mensajes de forma excesivamente rápida. "
+                "Este bot es un conector minimalista y no procesa spam. Por favor, baja la velocidad."
+            )
+            return False
+        elif data["warnings"] == 1 and data["last_ban_level"] == 0:
+            # Nivel 2: Bloqueo temporal de 1 minuto
+            data["ban_until"] = current_time + 60.0
+            data["last_ban_level"] = 2
+            data["warnings"] = 0
+            data["last_time"] = current_time
+            bot.reply_to(
+                message, 
+                "🚫 **Bloqueo temporal:** Has ignorado la advertencia. "
+                "Has sido bloqueado temporalmente durante **1 minuto**."
+            )
+            return False
+        elif data["last_ban_level"] == 2:
+            # Nivel 3: Bloqueo severo de 24 horas por reincidencia inmediata tras el castigo
+            data["ban_until"] = current_time + 86400.0
+            data["last_ban_level"] = 3
+            data["warnings"] = 0
+            data["last_time"] = current_time
+            bot.reply_to(
+                message, 
+                "🛑 **Bloqueo severo:** Has reincidido inmediatamente tras cumplirse tu sanción anterior. "
+                "Tu acceso ha sido restringido por **24 horas**."
+            )
+            return False
+    else:
+        # Restablecimiento progresivo tras periodos de calma prolongados
+        if time_diff > 10.0 and data["warnings"] > 0 and data["last_ban_level"] == 0:
+            data["warnings"] = 0
+        if data["last_ban_level"] > 0 and current_time > data["ban_until"] + 300:
+            data["last_ban_level"] = 0
+            data["warnings"] = 0
+
+    data["last_time"] = current_time
+    return True
+
+# 3. Comando /start
+@bot.message_handler(commands=['start'])
+def command_start(message):
+    if not check_antispam(message):
+        return
+
+    user_name = message.from_user.first_name or "Usuario"
+    user_id = message.from_user.id
+
+    welcome_text = (
+        f"¡Hola, {user_name}!\n\n"
+        f"🆔 **Tu ID de usuario:** `{user_id}`\n\n"
+        "Soy un conector minimalista diseñado para enlazar de manera directa y fluida con nuestra Mini App.\n\n"
+        "Haz clic en el botón inferior para abrir la aplicación."
     )
 
-  # Limpiar marcas de tiempo antiguas (mantener solo los últimos 5 segundos)
-  data['timestamps'] = [t for t in data['timestamps'] if now - t < 5]
-  data['timestamps'].append(now)
+    # Botón interactivo Inline para abrir la Mini App
+    markup = types.InlineKeyboardMarkup()
+    web_app_info = types.WebAppInfo(url=MINI_APP_URL)
+    btn_mini_app = types.InlineKeyboardButton(text="🚀 Abrir Mini App", web_app=web_app_info)
+    markup.add(btn_mini_app)
 
-  # Si envía más de 5 mensajes en menos de 5 segundos
-  if len(data['timestamps']) > 5:
-    data['ban_level'] += 1
-    if data['ban_level'] == 1:
-      return (
-          True,
-          '⚠️ Estás enviando mensajes demasiado rápido. Por favor, baja el ritmo.',
-      )
-    elif data['ban_level'] == 2:
-      data['ban_until'] = now + 60  # Bloqueo de 1 minuto
-      return (
-          True,
-          '🚫 Has sido bloqueado temporalmente durante **1 minuto** por saturar el chat.',
-      )
-    else:
-      data['ban_until'] = now + 86400  # Bloqueo de 24 horas
-      return (
-          '🚨 Bloqueo severo: Has reincidido en el spam. Estás sancionado durante **24 horas**.',
-      )
+    bot.send_message(message.chat.id, welcome_text, reply_markup=markup, parse_mode="Markdown")
 
-  return False, ''
-
-
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-  user_id = message.from_user.id
-  is_spam, warning_msg = check_spam(user_id)
-  if is_spam and 'bloqueado' in warning_msg:
-    bot.reply_to(message, warning_msg)
-    return
-
-  name = message.from_user.first_name
-
-  # Crear el botón Inline que abre la Mini App
-  markup = InlineKeyboardMarkup()
-  markup.add(
-      InlineKeyboardButton(
-          '✨ Abrir Creador de Telegra.ph', web_app={'url': MINI_APP_URL}
-      )
-  )
-
-  welcome_text = (
-      f'¡Hola, {name}! 👋\n\n'
-      'Soy un bot minimalista diseñado exclusivamente para conectar con la Mini App y ayudarte a formatear y publicar artículos en **Telegra.ph** de forma limpia y rápida.\n\n'
-      '👉 **Toca el botón de abajo** para abrir la interfaz web y empezar a redactar.'
-  )
-  bot.reply_to(message, welcome_text, parse_mode='Markdown', reply_markup=markup)
-
-
+# 4. Comando /help y Reglas Claras
 @bot.message_handler(commands=['help'])
-def send_help(message):
-  user_id = message.from_user.id
-  is_spam, warning_msg = check_spam(user_id)
-  if is_spam and 'bloqueado' in warning_msg:
-    bot.reply_to(message, warning_msg)
-    return
+def command_help(message):
+    if not check_antispam(message):
+        return
 
-  help_text = (
-      'ℹ️ **Información sobre este Bot:**\n\n'
-      '• **Qué soy:** Un conector directo a la Mini App de Telegra.ph.\n'
-      '• **Qué NO hago:** No soy un chatbot conversacional de IA, no respondo preguntas generales ni charlas.\n'
-      '• **Multimedia:** No proceso notas de voz ni imágenes directamente en este chat.\n\n'
-      'Usa el comando /start en cualquier momento para desplegar el creador.'
-  )
-  bot.reply_to(message, help_text, parse_mode='Markdown')
+    help_text = (
+        "ℹ️ **¿Qué es este bot?**\n"
+        "Este bot funciona estrictamente como un puente o conector técnico hacia nuestra Mini App.\n\n"
+        "❌ **Lo que NO hace este bot:**\n"
+        "• No es un chatbot de Inteligencia Artificial.\n"
+        "• No responde preguntas generales ni consultas de soporte técnico en este chat.\n"
+        "• No procesa notas de voz, audios, imágenes, documentos ni archivos multimedia.\n\n"
+        "👉 Usa /start para acceder a la Mini App."
+    )
+    bot.send_message(message.chat.id, help_text, parse_mode="Markdown")
 
-
-@bot.message_handler(func=lambda message: True)
+# Manejador general para cualquier otro mensaje de texto o multimedia entrante
+@bot.message_handler(func=lambda message: True, content_types=['text', 'photo', 'voice', 'audio', 'document', 'video', 'sticker'])
 def handle_fallback(message):
-  user_id = message.from_user.id
-  is_spam, warning_msg = check_spam(user_id)
-  if is_spam:
-    bot.reply_to(message, warning_msg)
-    return
+    if not check_antispam(message):
+        return
 
-  bot.reply_to(
-      message,
-      'ℹ️ Este chat solo procesa comandos. Usa /start para abrir el creador o'
-      ' /help para ver las reglas.',
-  )
+    response_text = (
+        "⚠️ Este bot opera exclusivamente como pasarela hacia la **Mini App**.\n\n"
+        "No interpreto mensajes directos ni archivos. Utiliza /start para abrir la aplicación o /help para conocer las reglas."
+    )
+    bot.send_message(message.chat.id, response_text, parse_mode="Markdown")
 
-
+# 6. Estructura del Servidor Flask (Webhook)
 @app.route(f'/{TOKEN}', methods=['POST'])
 def webhook():
-  json_string = request.get_data().decode('utf-8')
-  update = telebot.types.Update.de_json(json_string)
-  bot.process_new_updates([update])
-  return '!', 200
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return '', 200
+    else:
+        return 'Forbidden', 403
 
-
+# Ruta raíz de comprobación de estado (Health Check)
 @app.route('/')
 def index():
-  return 'Bot Telegra.ph Mini App activo.'
-
+    return "Bot conector de Mini App activo y funcionando en Webhook.", 200
 
 if __name__ == '__main__':
-  port = int(os.environ.get('PORT', 5000))
-  app.run(host='0.0.0.0', port=port)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
